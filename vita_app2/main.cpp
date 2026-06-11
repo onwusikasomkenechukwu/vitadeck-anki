@@ -1395,6 +1395,7 @@ int run_picker(Font& bold, Font& semibold, const DeckEntry* decks, int count,
         }
         if (pressed & SCE_CTRL_TRIANGLE) {            // Triangle = reset user data
             if (confirm_dialog(bold, semibold, "RESET USER DATA?")) return -2;
+            sceCtrlPeekBufferPositive(0, &pad, 1);    // re-prime: O-cancel must not bleed into the exit dialog (mirrors SELECT/stats above)
         }
         if (pressed & SCE_CTRL_SELECT) {              // SELECT = stats for highlighted deck
             show_stats(bold, semibold, decks, count, sel);
@@ -1811,6 +1812,18 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
         }
 
         if (pressed & SCE_CTRL_CIRCLE) {
+            // GPU-CPU sync (Bug 1 fix): the just-rendered frame may still be
+            // sampling image textures out of imgcache when we break below and
+            // imgcache.freeall() (loop exit) frees them -- the CPU frees memory
+            // the GPU command buffer still references -> MMU fault on image-heavy
+            // decks. Stall until the GPU has drained all pending draw commands so
+            // every subsequent texture free is safe. Must be the very first thing
+            // in this handler, before any state change / save / overlay / free.
+            // [INFERRED GXM behavior: vita2d_wait_rendering_done blocks the CPU
+            // until the GPU finishes the submitted frame -- consistent with its
+            // existing cache-miss use in ImgCache::get (main.cpp ~868) and the
+            // SDK's render-sync model; not byte-verified against libvita2d.a.]
+            vita2d_wait_rendering_done();
             audio::play(g_sfx_back);
             // O returns to the deck selector. App exit is the system PS button
             // (like other Vita apps), so there is no in-app EXIT_APP path now.
@@ -2117,6 +2130,20 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
         vita2d_swap_buffers();
     }
 
+    // Bug 1 follow-up: a plain sceGxmFinish (vita2d_wait_rendering_done) drains
+    // RENDERING but not the display flip queue. The last swap_buffers() leaves a
+    // flip pending that still owns a display buffer; freeing the image textures'
+    // CDRAM with that flip outstanding wedged the pipeline, so the picker's next
+    // sceGxmBeginScene blocked forever (screen frozen on the last reviewer card,
+    // PS button dead, while main() had already switched to the menu BGM). Fully
+    // idle the GPU *and* drain the flip queue before any texture free. This sits
+    // at the single freeall site so it covers every exit path (O, deck-complete,
+    // session-summary), not just the O handler. Confirmed on hardware: with the
+    // flip queue drained, freeing the image textures no longer wedges the next
+    // sceGxmBeginScene. [INFERRED GXM/vita2d behavior from gxm.h + vita2d_fini's
+    // teardown order; the fix is HW-verified, the internal mechanism is not.]
+    vita2d_wait_rendering_done();
+    sceGxmDisplayQueueFinish();
     imgcache.freeall();
 
     if (rev_log)   std::fclose(rev_log);
