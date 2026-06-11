@@ -1,0 +1,10 @@
+# Desktop exporter (exporter.py) dependencies.
+#
+# zstandard is required only to read the newer Anki ">= 2.1.50" .apkg format,
+# whose collection.anki21b (and media map) are zstd-compressed. Legacy .apkg
+# files export with the standard library alone.
+#
+# NOTE: this is an EXPORTER dependency for your default Python. It is NOT an
+# importer dependency — importer.py runs inside Anki's own managed venv.
+#     python -m pip install -r requirements.txt
+zstandard>=0.22

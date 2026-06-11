@@ -1,0 +1,52 @@
+# ---- Build output ----
+out/
+vita_app/build/
+vita_app2/build/
+*.vpk
+*.vpk.out
+*.velf
+*.self
+eboot.bin
+eboot.bin.out
+*.sfo
+
+# ---- Anki decks & exports (copyrighted / large / personal study material) ----
+*.apkg
+*.vitadeck/
+
+# ---- Audio (copyrighted music / sound packs — NOT redistributable) ----
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ogg
+*.aif
+*.aiff
+vita_app2/assets/audio/
+
+# ---- Crash dumps & scratch / inspection dirs ----
+*.psp2dmp
+*.psp2dmp.tmp
+dumps/
+# _import_test/ holds a copy of a real Anki collection — never commit
+_inspect/
+_inspect_real_cloze/
+_import_test/
+
+# ---- Generated SQLite / sidecars ----
+*.sqlite-wal
+*.sqlite-shm
+*.anki2
+*.anki21
+*.anki21b
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
