@@ -343,6 +343,37 @@ faulting PC against the unstripped ELF):
   main-thread stack, crashing inside freetype's rasterizer (`gray_convert_glyph`). Fixed by
   moving those buffers off the stack (`static`).
 
+## Exit-path GPU teardown + input-bleed fixes (2026-06-11)
+Two bugs that only showed up when *leaving* an image-heavy deck and on the picker; both fixed
+and confirmed on hardware.
+
+- **Image-deck exit: crash → hang → fixed.** Pressing **O** to leave the MileDowns MCAT deck
+  crashed instantly (text-only decks were unaffected). This is the *same* hazard as the draw
+  saga — touching GPU memory the pipeline still references — but on the **teardown** path:
+  `run_reviewer`'s loop exits and falls through to `imgcache.freeall()` (the 32-entry image
+  LRU). A first fix added `vita2d_wait_rendering_done()` at the top of the O handler; that
+  stopped the crash but then **hung**, frozen on the last reviewer card with the PS button
+  dead — while the **menu BGM was already playing**. Because the audio producer can only
+  advance *within* a playlist (never switch playlists on its own), that proved `run_reviewer`
+  had already returned and the stall was the **picker's first `sceGxmBeginScene`** waiting on a
+  display buffer that was never released. **Root cause:** `vita2d_wait_rendering_done()` is only
+  `sceGxmFinish` — it drains *rendering* but **not the display flip queue**; the last
+  `swap_buffers()` leaves a flip pending that still owns a display buffer, and freeing the
+  texture CDRAM with it outstanding wedges the pipeline. **Fix (HW-confirmed):** also call
+  `sceGxmDisplayQueueFinish()` — fully idling the GPU *and* draining the flip queue — right
+  before `imgcache.freeall()`, at the single freeall site so it covers **every** exit path (O,
+  deck-complete, session-summary), not just the O handler. GXM internals are inferred from
+  `gxm.h` + `vita2d_fini`'s teardown order (no vita2d source in this SDK); the fix itself is
+  hardware-verified.
+- **Picker O-bleed.** On the picker, **Triangle** → reset-confirm dialog, then **O** to cancel
+  correctly dismissed it but **immediately reopened the exit-confirm dialog** on the same frame.
+  The picker's `pad` isn't updated while the dialog runs, so the next frame's edge-detect
+  (`pad.buttons & ~prev.buttons`) read the still-held O as a fresh press. **Fix:** re-prime `pad`
+  via `sceCtrlPeekBufferPositive` right after the reset dialog returns — the identical pattern
+  already used for the SELECT/stats screen. The O/exit handler needs no fix (its entry `pad`
+  already holds O, so the bleed is unique to Triangle, where the entry button differs from the
+  cancel button). Same class as the earlier held-button "bleed" fixes.
+
 ## Audio expansion
 - The **menu playlist grew to 9 tracks** (`menu0..menu8.raw`, looping; `BGM_MAX` raised to 12).
 - **L / R skip previous / next track** in the main menu (`audio::bgm_skip`, handled in the BGM
@@ -376,9 +407,10 @@ faulting PC against the unstripped ELF):
   (title **VDCKREV01**), staged to the Vita each round.
 
 **Confirmed working on hardware**, including image cards (the GPU-draw fault is fixed — see the
-image-rendering saga). One cosmetic limitation remains: the LiveArea splash doesn't display. The
-one open thread outside the Vita app is the optional live `importer.py` run into the real Anki
-collection.
+image-rendering saga) and **leaving** image-heavy decks cleanly (the exit-teardown crash/hang is
+fixed — see the exit-path section). One cosmetic limitation remains: the LiveArea splash doesn't
+display. The one open thread outside the Vita app is the optional live `importer.py` run into the
+real Anki collection.
 
 ---
 
