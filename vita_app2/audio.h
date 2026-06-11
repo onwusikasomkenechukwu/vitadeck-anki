@@ -62,7 +62,7 @@ static std::atomic<bool> g_mixer_active{false};
 // the whole ~37MB song into RAM. ----
 constexpr uint32_t BGM_RING = 65536;   // power-of-two SPSC ring, ~1.36s mono
 constexpr uint32_t BGM_MASK = BGM_RING - 1;
-constexpr int BGM_MAX  = 6;            // songs per playlist
+constexpr int BGM_MAX  = 12;           // songs per playlist
 alignas(64) static int16_t g_ring[BGM_RING];
 alignas(64) static std::atomic<uint32_t> g_ring_w{0};
 alignas(64) static std::atomic<uint32_t> g_ring_r{0};
@@ -74,6 +74,7 @@ static char          g_pl[BGM_MAX][256];   // current playlist (file paths)
 static int           g_pl_count  = 0;
 static int           g_pl_idx    = 0;
 static std::atomic<bool> g_pl_switch{false};  // request: restart at g_pl[0]
+static std::atomic<int>  g_pl_skip{0};        // request: skip +N / -N tracks
 
 struct Telemetry {
     uint32_t underrun_samples;
@@ -175,6 +176,23 @@ inline int bgm_producer(SceSize, void*) {
                 if (!g_bgm_fp) g_stat_open_failures.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Manual track skip (L/R in the menu): advance g_pl_idx by the requested
+        // delta and flush the buffered tail so the new song starts immediately.
+        int skip = g_pl_skip.exchange(0, std::memory_order_acq_rel);
+        if (skip != 0 && g_pl_count > 0) {
+            if (g_bgm_fp) { std::fclose(g_bgm_fp); g_bgm_fp = nullptr; }
+            char path[256] = "";
+            sceKernelLockMutex(g_mutex, 1, nullptr);
+            g_pl_idx = ((g_pl_idx + skip) % g_pl_count + g_pl_count) % g_pl_count;
+            std::snprintf(path, sizeof(path), "%s", g_pl[g_pl_idx]);
+            ring_reset();
+            sceKernelUnlockMutex(g_mutex, 1);
+            g_stat_switches.fetch_add(1, std::memory_order_relaxed);
+            if (path[0]) {
+                g_bgm_fp = std::fopen(path, "rb");
+                if (!g_bgm_fp) g_stat_open_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (!g_bgm_fp) { sceKernelDelayThread(20000); continue; }
         uint32_t r = g_ring_r.load(std::memory_order_acquire);
         uint32_t w = g_ring_w.load(std::memory_order_relaxed);
@@ -257,6 +275,12 @@ inline void bgm_play(const char* const* paths, int count, int vol) {
     sceKernelUnlockMutex(g_mutex, 1);
     g_pl_switch.store(true, std::memory_order_release);
     bgm_fade(vol);
+}
+
+// Skip forward (+1) / back (-1) within the current playlist. Wraps. Multiple
+// rapid presses accumulate. No-op if no playlist is set.
+inline void bgm_skip(int dir) {
+    g_pl_skip.fetch_add(dir, std::memory_order_release);
 }
 
 // Load a raw 48 kHz / stereo / s16le clip. Returns {nullptr,0} on failure

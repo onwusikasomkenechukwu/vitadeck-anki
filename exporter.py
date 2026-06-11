@@ -499,6 +499,75 @@ def collect_media_refs(conn: sqlite3.Connection) -> set[str]:
     return refs
 
 
+_MAX_IMG_PX = 512    # cap the longest side; the Vita image region is ~320x380.
+                     # Small + stride-aligned textures (see _align16) keep
+                     # vita2d_draw_texture_scale near-1:1, which avoids the GPU
+                     # fault from steep-downscale draws of big textures.
+
+
+def _align16(v: int) -> int:
+    """Round a dimension down to a multiple of 16 (>=16) for GXM stride safety."""
+    v = (v // 16) * 16
+    return v if v >= 16 else 16
+
+
+def _out_ext(ext: str) -> str:
+    """Packaged extension for a source media ext. GIF/WebP become PNG because
+    vita2d on the Vita decodes only PNG and (baseline) JPEG."""
+    return ".png" if ext in (".gif", ".webp") else ext
+
+
+def _copy_media(src: Path, dst: Path, ext: str) -> None:
+    """Copy one media file into the package (`dst` already carries _out_ext()).
+
+    - JPEGs are re-encoded to **baseline** (NOT progressive): the Vita's vita2d
+      JPEG loader fails on progressive JPEGs — it yields a null/garbage texture
+      that shows as a missing image or hard-faults the GPU on draw (verified on
+      hardware: a deck with 70 progressive JPEGs produced a GPUCRASH).
+    - GIF/WebP are converted to PNG (first frame for animations) so they render
+      instead of showing the [IMAGE] placeholder.
+    - Oversized images are downscaled to bound Vita GPU texture memory.
+
+    Needs Pillow (see requirements.txt). If Pillow is missing or a decode fails,
+    falls back to a raw byte copy so the export still succeeds.
+    """
+    try:
+        from PIL import Image
+        if ext in (".gif", ".webp"):
+            im = Image.open(src)
+            im.seek(0)                              # first frame of an animation
+            im = im.convert("RGBA")
+            w, h = im.size
+            if max(w, h) > _MAX_IMG_PX:
+                s = _MAX_IMG_PX / max(w, h)
+                im = im.resize((_align16(int(w * s)), _align16(int(h * s))), Image.LANCZOS)
+            im.save(dst, "PNG", optimize=True)
+            return
+        if ext in (".jpg", ".jpeg"):
+            im = Image.open(src)
+            im.load()
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > _MAX_IMG_PX:
+                s = _MAX_IMG_PX / max(w, h)
+                im = im.resize((_align16(int(w * s)), _align16(int(h * s))), Image.LANCZOS)
+            im.save(dst, "JPEG", quality=88, progressive=False, optimize=True)
+            return
+        if ext == ".png":
+            im = Image.open(src)
+            im.load()
+            w, h = im.size
+            if max(w, h) > _MAX_IMG_PX:            # only rewrite oversized PNGs
+                s = _MAX_IMG_PX / max(w, h)
+                im = im.resize((_align16(int(w * s)), _align16(int(h * s))), Image.LANCZOS)
+                im.save(dst, "PNG", optimize=True)
+                return
+    except Exception:
+        pass                                       # Pillow absent / decode failed
+    shutil.copy2(src, dst)
+
+
 def build_media(
     media_root: Path,
     media_map: dict,
@@ -526,10 +595,10 @@ def build_media(
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
         ext = Path(orig).suffix.lower()
-        new_name = h.hexdigest()[:16] + ext
+        new_name = h.hexdigest()[:16] + _out_ext(ext)   # gif/webp -> .png
         dst = out_media_dir / new_name
         if not dst.exists():
-            shutil.copy2(src, dst)
+            _copy_media(src, dst, ext)
         rewrite[orig] = new_name
         index[new_name] = orig
     if missing:

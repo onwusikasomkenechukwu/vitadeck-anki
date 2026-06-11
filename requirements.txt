@@ -8,3 +8,9 @@
 # importer dependency — importer.py runs inside Anki's own managed venv.
 #     python -m pip install -r requirements.txt
 zstandard>=0.22
+
+# Pillow re-encodes media on export: progressive JPEGs -> baseline (the Vita's
+# vita2d loader GPU-crashes on progressive JPEGs) and downscales oversized
+# images. Optional but strongly recommended; without it images are copied raw.
+Pillow>=10.0
+

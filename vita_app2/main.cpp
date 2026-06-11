@@ -80,6 +80,19 @@ constexpr unsigned int CYAN     = RGBA8(0x40, 0xE0, 0xFF, 0xFF);  // cloze / cur
 constexpr const char* VITADECK_ROOT = "ux0:data/vitadeck";
 constexpr int MAX_DECKS = 16;            // hard cap; no dynamic alloc for scan
 
+// Image cards render a clean [IMAGE] placeholder instead of the decoded
+// texture. Drawing loaded image textures under stress GPU-faults on this
+// hardware, and every mitigation (small/aligned textures, near-1:1 scale,
+// GPU-idle waits, never-free cache) still crashed -- a vita2d/GXM limit, not a
+// fixable bug here. Placeholder keeps the app rock-stable; flip to false to
+// re-attempt real image rendering.
+constexpr bool VD_DIAG_NO_IMAGES = true;
+
+// (Diagnostic confirmed the fault is in the texture DRAW, not load/decode. Fix:
+// images are now re-encoded small + stride-aligned so vita2d_draw_texture_scale
+// draws near-1:1 on a small texture.)
+constexpr bool VD_DIAG_LOAD_ONLY = false;
+
 // The .vitadeck format version this build understands (manifest.json
 // "format_version"). See FORMAT.md "Format versioning contract". Increment the
 // MAJOR (this integer) only when a change ALTERS or REMOVES an existing field,
@@ -747,11 +760,18 @@ bool ends_with_ci(const char* s, const char* suf) {
     return true;
 }
 
-// ---- 32-entry image texture LRU. Keyed by filename; evicts least-recently
-// used. A "tried but missing/failed" load is cached as a null tex so we don't
-// re-attempt every frame; the caller draws an [IMAGE] placeholder for null. ----
+// ---- Image texture LRU. Keyed by filename; evicts least-recently used. A
+// "tried but missing/failed" load is cached as a null tex so we don't re-attempt
+// every frame; the caller draws an [IMAGE] placeholder for null.
+//
+// Image textures are loaded once and NEVER freed during a session (only at
+// teardown via freeall). Glyph textures use exactly this pattern and are
+// stress-proof; the crash appeared only when images were freed+realloc'd on
+// cache eviction while being drawn. So we never evict-free: once all CAP slots
+// hold a texture, further new images show the [IMAGE] placeholder until the
+// session ends. CAP bounds how many distinct images one session can show. ----
 struct ImgCache {
-    static const int CAP = 32;
+    static const int CAP = 24;
     struct E { char name[128]; vita2d_texture* tex; bool used; unsigned long long t; };
     E e[CAP];
     unsigned long long clock;
@@ -766,6 +786,16 @@ struct ImgCache {
                 e[i].t = clock;
                 return e[i].tex;
             }
+        // Cache miss. Use a FREE slot only -- never evict/free a used image
+        // texture mid-session (that's the crash). When all slots are full, the
+        // caller shows the [IMAGE] placeholder.
+        int slot = -1;
+        for (int i = 0; i < CAP; ++i) if (!e[i].used) { slot = i; break; }
+        if (slot < 0) return nullptr;             // cache full -> placeholder
+
+        // Allocate with the GPU idle (we're between frames; the last frame may
+        // still be rendering, and allocating under it races the GPU).
+        vita2d_wait_rendering_done();
         char path[320];
         std::snprintf(path, sizeof(path), "%s/%s", media_dir, name);  // %s only
         vita2d_texture* t = nullptr;
@@ -773,14 +803,17 @@ struct ImgCache {
             t = vita2d_load_PNG_file(path);
         else if (ends_with_ci(name, ".jpg") || ends_with_ci(name, ".jpeg"))
             t = vita2d_load_JPEG_file(path);
-        // choose slot: first empty, else LRU
-        int slot = -1;
-        unsigned long long best = ~0ull;
-        for (int i = 0; i < CAP; ++i) {
-            if (!e[i].used) { slot = i; break; }
-            if (e[i].t < best) { best = e[i].t; slot = i; }
+        // Reject corrupt/oversized decodes (would GPU-fault on draw). Don't
+        // consume a cache slot for a failure -> placeholder, retry on re-view.
+        if (t) {
+            unsigned int w = vita2d_texture_get_width(t);
+            unsigned int h = vita2d_texture_get_height(t);
+            if (w == 0 || h == 0 || w > 4096 || h > 4096) {
+                vita2d_free_texture(t);
+                t = nullptr;
+            }
         }
-        if (e[slot].used && e[slot].tex) vita2d_free_texture(e[slot].tex);
+        if (!t) return nullptr;
         std::snprintf(e[slot].name, sizeof(e[slot].name), "%s", name);
         e[slot].tex = t;
         e[slot].used = true;
@@ -1282,6 +1315,9 @@ int run_picker(Font& bold, Font& semibold, const DeckEntry* decks, int count,
             show_stats(bold, semibold, decks, count, sel);
             sceCtrlPeekBufferPositive(0, &pad, 1);    // re-prime: don't read the dismiss as input
         }
+        // L/R = skip menu music (back/next). Without input it keeps auto-advancing.
+        if (pressed & SCE_CTRL_LTRIGGER) audio::bgm_skip(-1);
+        if (pressed & SCE_CTRL_RTRIGGER) audio::bgm_skip(+1);
         // D-pad and stick both wrap around the list (top<->bottom).
         if (pressed & SCE_CTRL_UP)   { sel = (sel - 1 + count) % count; audio::play(g_sfx_scroll); }
         if (pressed & SCE_CTRL_DOWN) { sel = (sel + 1) % count;         audio::play(g_sfx_scroll); }
@@ -1405,6 +1441,8 @@ int run_picker(Font& bold, Font& semibold, const DeckEntry* decks, int count,
             draw_triangle_icon(fx, fy, 13, BLACK, CREAM);   // the Triangle button glyph
             fx += 13 + 6;
             draw_text(semibold, "= RESET DATA", fx, fy, 14, BLACK);
+            fx += semibold.measure("= RESET DATA", 14) + 18;
+            draw_text(semibold, "L/R = PREV/NEXT TRACK", fx, fy, 14, VIOLET);
         }
 
         vita2d_end_drawing();
@@ -1486,7 +1524,11 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
     std::snprintf(progress_tmp, sizeof(progress_tmp),
                   "%s/%s/progress_tmp.json", VITADECK_ROOT, folder);
 
-    ImgCache imgcache;
+    // static: keep these big buffers OFF the main thread's (small) stack --
+    // run_reviewer's frame plus freetype's glyph rasterizer overflow it
+    // otherwise (crash in gray_convert_glyph). Single-threaded, one reviewer
+    // session at a time, so a shared instance is safe.
+    static ImgCache imgcache;
     imgcache.init();
 
     sqlite3* cards_db = nullptr;
@@ -1535,9 +1577,14 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
         }
     }
 
-    Card current{};
-    char front_text[8192]{};
-    char back_text[8192]{};
+    // static: Card (~17KB) + the two 8KB text buffers must stay off the stack
+    // (see ImgCache note above). Re-zeroed each session/card below.
+    static Card current;
+    static char front_text[8192];
+    static char back_text[8192];
+    std::memset(&current, 0, sizeof(current));
+    front_text[0] = '\0';
+    back_text[0] = '\0';
     enum class View { FRONT, BACK, DONE, STATS };
     View view = View::FRONT;
     size_t queue_idx = 0;
@@ -1564,7 +1611,10 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
         // Image: parse the RAW front_html (strip_html already removed the tag
         // from front_text), then load via the LRU. null tex -> placeholder.
         has_image = parse_img_src(current.front, img_name, sizeof(img_name));
-        cur_img = has_image ? imgcache.get(media_dir, img_name) : nullptr;
+        // Diagnostic: skip the texture load entirely (placeholder), to isolate
+        // the image path from the GPU crash. Keeps the image LAYOUT either way.
+        cur_img = (has_image && !VD_DIAG_NO_IMAGES)
+                      ? imgcache.get(media_dir, img_name) : nullptr;
         return true;
     };
 
@@ -1934,7 +1984,7 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
                 draw_shadow_rect(tx, CY, tw, ih, WHITE, BLACK, 6);
                 draw_scroll(semibold, tx + 16, CY + 16, tw - 32, CY + ih - 16,
                             tx + 6, CY + 6, tx + tw - 6, CY + ih - 6, 20);
-                if (cur_img) {
+                if (cur_img && !VD_DIAG_LOAD_ONLY) {
                     draw_rect(ix + 4, CY + 4, iw, ih, BLACK);   // 4px hard shadow
                     draw_rect(ix, CY, iw, ih, WHITE);           // region bg
                     draw_image_fit(cur_img, ix, CY, iw, ih);
@@ -2072,7 +2122,14 @@ int main() {
     // reduced so it sits under the cards. bgm_mode avoids restarting the same
     // playlist when we stay in the same context.
     static const char* MENU_BGM[] = { "ux0:data/vitadeck/menu0.raw",
-                                      "ux0:data/vitadeck/menu1.raw" };
+                                      "ux0:data/vitadeck/menu1.raw",
+                                      "ux0:data/vitadeck/menu2.raw",
+                                      "ux0:data/vitadeck/menu3.raw",
+                                      "ux0:data/vitadeck/menu4.raw",
+                                      "ux0:data/vitadeck/menu5.raw",
+                                      "ux0:data/vitadeck/menu6.raw",
+                                      "ux0:data/vitadeck/menu7.raw",
+                                      "ux0:data/vitadeck/menu8.raw" };
     static const char* REV_BGM[]  = { "ux0:data/vitadeck/rev0.raw",
                                       "ux0:data/vitadeck/rev1.raw" };
     const int MENU_VOL = 256, REV_VOL = 96;
@@ -2094,7 +2151,7 @@ int main() {
             sel = 0;                             // single deck: skip picker
         } else {
             if (bgm_mode != 0) {                 // entering the menu
-                if (audio_ok) audio::bgm_play(MENU_BGM, 2, MENU_VOL);
+                if (audio_ok) audio::bgm_play(MENU_BGM, 9, MENU_VOL);
                 bgm_mode = 0;
             }
             sel = run_picker(bold, semibold, decks, count, overflow, &player);

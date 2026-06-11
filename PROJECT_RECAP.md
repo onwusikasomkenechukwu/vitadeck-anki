@@ -295,7 +295,45 @@ trap manifest, then restored.
 
 ---
 
+## Media pipeline & the image-rendering saga
+Stress-testing image-heavy med decks (MileDowns MCAT, Multivariable Calculus) surfaced a chain
+of GPU faults, each decoded from `psp2dmp` coredumps (gunzip → ELF core → symbolicate the
+faulting PC against the unstripped ELF):
+
+- **Progressive JPEGs → baseline.** vita2d's JPEG loader yields a null/garbage texture for
+  progressive JPEGs — a missing image or a **GPU crash on draw** (MileDowns alone had 288).
+  `exporter.py` now re-encodes JPEGs to **baseline** via Pillow (added to `requirements.txt`),
+  and all on-device media was re-encoded in place.
+- **GIF/WebP → PNG.** vita2d can't decode GIF/WebP (they showed `[IMAGE]`). The exporter now
+  converts them to PNG (first frame) and the `<img>` refs follow; on-device decks were patched
+  in place (convert files + rewrite each `cards.sqlite`).
+- **Size + stride caps.** Images are capped to **≤512px with dimensions aligned to ×16**
+  (`_MAX_IMG_PX` / `_align16`) to bound GPU texture memory and keep the draw near-1:1.
+- **The hard wall — image draws GPU-fault under stress.** A clean isolation chain (no-images →
+  stable; load-but-don't-draw → stable; load+draw → crash) proved the fault is specifically
+  **`vita2d_draw_texture_scale` of decoded image textures under rapid flipping**. It survived
+  *every* mitigation — small/aligned textures, near-1:1 scale, GPU-idle `wait_rendering_done`,
+  and a never-free cache mirroring the stress-proof glyph path. Concluded: a vita2d/GXM limit,
+  not an app bug. **Image cards now render a clean `[IMAGE]` placeholder** (`VD_DIAG_NO_IMAGES`),
+  which is rock-stable; the loader/exporter groundwork stays in so real images can be revisited
+  later (offscreen render-target, or a glyph-style texture atlas).
+- **Stack-overflow fix.** Raising the image cache for the never-free experiment pushed
+  `run_reviewer`'s big locals (a `Card` + two 8 KB text buffers + the cache) past the small
+  main-thread stack, crashing inside freetype's rasterizer (`gray_convert_glyph`). Fixed by
+  moving those buffers off the stack (`static`).
+
+## Audio expansion
+- The **menu playlist grew to 9 tracks** (`menu0..menu8.raw`, looping; `BGM_MAX` raised to 12).
+- **L / R skip previous / next track** in the main menu (`audio::bgm_skip`, handled in the BGM
+  producer with a ring flush so the new song starts instantly); auto-advance on track end is
+  unchanged, and the control is shown in the picker footer.
+
+---
+
 ## Known limitation
+- **Image cards render an `[IMAGE]` placeholder** instead of the decoded image — drawing image
+  textures GPU-faults under stress (see the saga above); a vita2d/GXM limit. Everything else
+  (text, cloze, gamification, stats, audio, resume) is fully functional.
 - **LiveArea splash background doesn't display** (accepted). The packaging is byte-correct
   against the working SDK sample (valid `a1` template, 8-bit palette PNGs, `content-rev`
   bumped) — the most likely cause is the Vita's LiveArea cache not refreshing on
@@ -310,13 +348,14 @@ trap manifest, then restored.
   `test_primitives.cpp` (Step-1 test vpk), `CMakeLists.txt`,
   `sce_sys/` (icon + LiveArea), `assets/fonts/`, `assets/audio/` (SFX in vpk)
 - SD-card data (`ux0:data/vitadeck/`): the `.vitadeck` decks, `player.json`, per-deck
-  `progress.json`/`reviews.jsonl`, and the BGM streams `menu0/menu1/rev0/rev1.raw`
+  `progress.json`/`reviews.jsonl`, and the BGM streams `menu0..menu8.raw` (menu) +
+  `rev0/rev1.raw` (reviewer). Audio (copyrighted songs/SFX) and decks are gitignored.
 - Build: MSYS2 + vitasdk (`C:\msys64\usr\local\vitasdk`) → `vitadeck_p3.vpk`
   (title **VDCKREV01**), staged to the Vita each round.
 
-**Everything is confirmed working on hardware except the LiveArea splash.** The one open
-thread outside the Vita app is the optional live `importer.py` run into the real Anki
-collection.
+**Confirmed working on hardware**, with two accepted limitations: image cards show a
+placeholder (GPU draw limit) and the LiveArea splash doesn't display. The one open thread
+outside the Vita app is the optional live `importer.py` run into the real Anki collection.
 
 ---
 

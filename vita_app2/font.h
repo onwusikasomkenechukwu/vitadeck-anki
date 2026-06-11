@@ -206,4 +206,16 @@ struct Font {
     }
 
     int line_height(int px) { return slot(px)->line_h; }
+
+    // Pre-rasterize the printable ASCII + Latin-1 range at size `px`. MUST be
+    // called OUTSIDE a vita2d scene (between frames / before the main loop).
+    // This moves all glyph-texture creation out of the draw scene: creating
+    // textures mid-scene (the default lazy path) races the GPU and, under the
+    // memory pressure of image cards, causes async GPU faults. After prewarm,
+    // draw()/measure() only ever hit already-cached glyphs.
+    void prewarm(int px) {
+        if (!ok) return;
+        FontSize* s = slot(px);
+        for (unsigned int cp = 0x20; cp <= 0xFF; ++cp) glyph(s, cp);
+    }
 };
