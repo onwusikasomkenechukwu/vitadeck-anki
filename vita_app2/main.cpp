@@ -80,18 +80,14 @@ constexpr unsigned int CYAN     = RGBA8(0x40, 0xE0, 0xFF, 0xFF);  // cloze / cur
 constexpr const char* VITADECK_ROOT = "ux0:data/vitadeck";
 constexpr int MAX_DECKS = 16;            // hard cap; no dynamic alloc for scan
 
-// Image cards render a clean [IMAGE] placeholder instead of the decoded
-// texture. Drawing loaded image textures under stress GPU-faults on this
-// hardware, and every mitigation (small/aligned textures, near-1:1 scale,
-// GPU-idle waits, never-free cache) still crashed -- a vita2d/GXM limit, not a
-// fixable bug here. Placeholder keeps the app rock-stable; flip to false to
-// re-attempt real image rendering.
-constexpr bool VD_DIAG_NO_IMAGES = true;
-
-// (Diagnostic confirmed the fault is in the texture DRAW, not load/decode. Fix:
-// images are now re-encoded small + stride-aligned so vita2d_draw_texture_scale
-// draws near-1:1 on a small texture.)
-constexpr bool VD_DIAG_LOAD_ONLY = false;
+// Image rendering. The long-standing image-draw GPU fault (CONFIRMED FIXED on
+// hardware) was a texture WRAP-mode bug, not format/size/free-timing: scaled,
+// linear-filtered draws of non-power-of-two textures with GXM's default REPEAT
+// address mode interpolate the edge texel against the wrapped opposite edge ->
+// GPU MMU fault. Glyphs share the format/path but draw 1:1, so they never
+// sample across the edge and never faulted. img_to_rgba32() now forces
+// SCE_GXM_TEXTURE_ADDR_CLAMP (valid for NPOT) on every cached image. The full
+// diagnosis (including the disproven 24-bit-format theory) is in PROJECT_RECAP.
 
 // The .vitadeck format version this build understands (manifest.json
 // "format_version"). See FORMAT.md "Format versioning contract". Increment the
@@ -760,18 +756,98 @@ bool ends_with_ci(const char* s, const char* suf) {
     return true;
 }
 
-// ---- Image texture LRU. Keyed by filename; evicts least-recently used. A
-// "tried but missing/failed" load is cached as a null tex so we don't re-attempt
-// every frame; the caller draws an [IMAGE] placeholder for null.
+// ---- Re-wrap a freshly decoded image into a 32-bit A8B8G8R8 texture -- the
+// SAME texture kind the glyph cache creates (vita2d_create_empty_texture_format
+// + CPU pixel fill, font.h:165) and draws, which is stress-proof. This is the
+// root-cause fix for the image-draw GPU fault: vita2d's JPEG loader hands back
+// 24-bit textures (SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR color / U8_R111 gray --
+// verified in xerpi/libvita2d vita2d_image_jpeg.c, formats defined at
+// psp2/gxm.h:824 and :516 in this SDK), and drawing 24bpp GXM textures under
+// rapid rebinding is what crashes. PNG/BMP already decode to 32-bit A8B8G8R8
+// (psp2/gxm.h:858) via vita2d_create_empty_texture's default format, but we
+// convert them too so EVERY cached image is byte-identical in kind to the
+// proven glyph path. Returns a new caller-owned texture, or nullptr on an
+// unexpected source format (caller then shows the [IMAGE] placeholder).
 //
-// Image textures are loaded once and NEVER freed during a session (only at
-// teardown via freeall). Glyph textures use exactly this pattern and are
-// stress-proof; the crash appeared only when images were freed+realloc'd on
-// cache eviction while being drawn. So we never evict-free: once all CAP slots
-// hold a texture, further new images show the [IMAGE] placeholder until the
-// session ends. CAP bounds how many distinct images one session can show. ----
+// [INFERRED from source, pending on-hardware confirmation] The exact loader
+// formats above come from the upstream vita2d source, not this SDK's binary;
+// they match the SDK's gxm.h constants and the known libjpeg/libpng decode
+// paths, but the binary in libvita2d.a was not disassembled to byte-verify.
+vita2d_texture* img_to_rgba32(vita2d_texture* src) {
+    if (!src) return nullptr;
+    unsigned int w = vita2d_texture_get_width(src);
+    unsigned int h = vita2d_texture_get_height(src);
+    if (w == 0 || h == 0) return nullptr;
+    SceGxmTextureFormat fmt = vita2d_texture_get_format(src);
+    unsigned int sstride = vita2d_texture_get_stride(src);          // bytes/row
+    const unsigned char* sp = (const unsigned char*)vita2d_texture_get_datap(src);
+    if (!sp) return nullptr;
+
+    vita2d_texture* dst = vita2d_create_empty_texture_format(
+        w, h, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+    if (!dst) return nullptr;
+    unsigned int* dp = (unsigned int*)vita2d_texture_get_datap(dst);
+    if (!dp) { vita2d_free_texture(dst); return nullptr; }
+    unsigned int dstride = vita2d_texture_get_stride(dst) / 4;      // pixels/row
+
+    // RGBA8 packs R into the low byte, matching A8B8G8R8 memory order (R,G,B,A);
+    // the glyph cache fills its textures the identical way (font.h:175).
+    if (fmt == SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR) {                 // JPEG color: 3bpp B,G,R
+        for (unsigned int y = 0; y < h; ++y) {
+            const unsigned char* s = sp + (size_t)y * sstride;
+            unsigned int* d = dp + (size_t)y * dstride;
+            for (unsigned int x = 0; x < w; ++x)
+                d[x] = RGBA8(s[x*3 + 2], s[x*3 + 1], s[x*3 + 0], 255);
+        }
+    } else if (fmt == SCE_GXM_TEXTURE_FORMAT_U8_R111) {            // JPEG gray: 1bpp
+        for (unsigned int y = 0; y < h; ++y) {
+            const unsigned char* s = sp + (size_t)y * sstride;
+            unsigned int* d = dp + (size_t)y * dstride;
+            for (unsigned int x = 0; x < w; ++x) d[x] = RGBA8(s[x], s[x], s[x], 255);
+        }
+    } else if (fmt == SCE_GXM_TEXTURE_FORMAT_A8B8G8R8) {           // PNG/BMP: 4bpp R,G,B,A
+        unsigned int s32stride = sstride / 4;
+        const unsigned int* s32 = (const unsigned int*)sp;
+        for (unsigned int y = 0; y < h; ++y) {
+            const unsigned int* s = s32 + (size_t)y * s32stride;
+            unsigned int* d = dp + (size_t)y * dstride;
+            for (unsigned int x = 0; x < w; ++x) d[x] = s[x];
+        }
+    } else {
+        vita2d_free_texture(dst);          // unexpected format -> placeholder
+        return nullptr;
+    }
+
+    // THE image-draw crash: NPOT linear textures GPU-fault when sampled with the
+    // default REPEAT wrap under a SCALED (edge-interpolating) draw. Glyphs dodge
+    // it only because they draw 1:1 and never sample across the texture edge;
+    // scaled image draws interpolate the last row/column against the wrapped
+    // opposite edge, which is invalid for non-power-of-two linear textures ->
+    // GPU MMU fault. The exporter's x16 alignment does NOT make dimensions POT,
+    // so it never helped. vita2d never sets a wrap mode (verified in
+    // vita2d_texture.c), so the texture sits at GXM's REPEAT default (gxm.h:901,
+    // value 0) until we override it. CLAMP (gxm.h:903) is valid for NPOT and
+    // stops the fault. Setters verified at gxm.h:1823/1832; struct .gxm_tex is
+    // public in vita2d.h:37.
+    sceGxmTextureSetUAddrMode(&dst->gxm_tex, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&dst->gxm_tex, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetMinFilter(&dst->gxm_tex, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMagFilter(&dst->gxm_tex, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    return dst;
+}
+
+// ---- Image texture LRU. Keyed by filename; evicts least-recently used when
+// full. A failed/unknown decode is NOT cached (returns null -> the caller draws
+// an [IMAGE] placeholder and retries on re-view).
+//
+// Every cached texture is the 32-bit A8B8G8R8 copy produced by img_to_rgba32
+// (see above) -- byte-identical in kind to the stress-proof glyph textures.
+// With the format fixed, evict-on-full is safe: eviction frees only while the
+// GPU is idle (vita2d_wait_rendering_done below, between frames), and the prior
+// "never-free still crashed" experiment proved free-timing was never the cause.
+// CAP bounds resident textures (32 x up to 512x512x4 = up to 32 MB CDRAM). ----
 struct ImgCache {
-    static const int CAP = 24;
+    static const int CAP = 32;
     struct E { char name[128]; vita2d_texture* tex; bool used; unsigned long long t; };
     E e[CAP];
     unsigned long long clock;
@@ -786,34 +862,43 @@ struct ImgCache {
                 e[i].t = clock;
                 return e[i].tex;
             }
-        // Cache miss. Use a FREE slot only -- never evict/free a used image
-        // texture mid-session (that's the crash). When all slots are full, the
-        // caller shows the [IMAGE] placeholder.
-        int slot = -1;
-        for (int i = 0; i < CAP; ++i) if (!e[i].used) { slot = i; break; }
-        if (slot < 0) return nullptr;             // cache full -> placeholder
-
-        // Allocate with the GPU idle (we're between frames; the last frame may
-        // still be rendering, and allocating under it races the GPU).
+        // Cache miss. Decode + convert with the GPU idle (we're between frames;
+        // the last frame may still be rendering, and touching textures under it
+        // races the GPU).
         vita2d_wait_rendering_done();
         char path[320];
         std::snprintf(path, sizeof(path), "%s/%s", media_dir, name);  // %s only
-        vita2d_texture* t = nullptr;
+        vita2d_texture* src = nullptr;
         if (ends_with_ci(name, ".png"))
-            t = vita2d_load_PNG_file(path);
+            src = vita2d_load_PNG_file(path);
         else if (ends_with_ci(name, ".jpg") || ends_with_ci(name, ".jpeg"))
-            t = vita2d_load_JPEG_file(path);
-        // Reject corrupt/oversized decodes (would GPU-fault on draw). Don't
-        // consume a cache slot for a failure -> placeholder, retry on re-view.
-        if (t) {
-            unsigned int w = vita2d_texture_get_width(t);
-            unsigned int h = vita2d_texture_get_height(t);
+            src = vita2d_load_JPEG_file(path);
+        // Reject corrupt/oversized decodes before conversion.
+        if (src) {
+            unsigned int w = vita2d_texture_get_width(src);
+            unsigned int h = vita2d_texture_get_height(src);
             if (w == 0 || h == 0 || w > 4096 || h > 4096) {
-                vita2d_free_texture(t);
-                t = nullptr;
+                vita2d_free_texture(src);
+                src = nullptr;
             }
         }
-        if (!t) return nullptr;
+        if (!src) return nullptr;
+        // Convert to 32-bit A8B8G8R8 and discard the loader's source texture
+        // (which may be the 24-bit format that GPU-faults on draw).
+        vita2d_texture* t = img_to_rgba32(src);
+        vita2d_free_texture(src);
+        if (!t) return nullptr;            // unknown format -> placeholder
+
+        // Pick a slot: a free one, else evict the least-recently-used.
+        int slot = -1;
+        for (int i = 0; i < CAP; ++i) if (!e[i].used) { slot = i; break; }
+        if (slot < 0) {
+            unsigned long long oldest = ~0ULL;
+            for (int i = 0; i < CAP; ++i)
+                if (e[i].used && e[i].t < oldest) { oldest = e[i].t; slot = i; }
+            if (e[slot].tex) vita2d_free_texture(e[slot].tex);  // GPU idle (above)
+            e[slot].used = false;
+        }
         std::snprintf(e[slot].name, sizeof(e[slot].name), "%s", name);
         e[slot].tex = t;
         e[slot].used = true;
@@ -1611,10 +1696,9 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
         // Image: parse the RAW front_html (strip_html already removed the tag
         // from front_text), then load via the LRU. null tex -> placeholder.
         has_image = parse_img_src(current.front, img_name, sizeof(img_name));
-        // Diagnostic: skip the texture load entirely (placeholder), to isolate
-        // the image path from the GPU crash. Keeps the image LAYOUT either way.
-        cur_img = (has_image && !VD_DIAG_NO_IMAGES)
-                      ? imgcache.get(media_dir, img_name) : nullptr;
+        // Load via the LRU (CLAMP-wrapped 32-bit copy; see img_to_rgba32). A
+        // null tex (missing file / unknown format) falls back to a placeholder.
+        cur_img = has_image ? imgcache.get(media_dir, img_name) : nullptr;
         return true;
     };
 
@@ -1984,12 +2068,12 @@ RevResult run_reviewer(Font& bold, Font& semibold, const DeckEntry* deck,
                 draw_shadow_rect(tx, CY, tw, ih, WHITE, BLACK, 6);
                 draw_scroll(semibold, tx + 16, CY + 16, tw - 32, CY + ih - 16,
                             tx + 6, CY + 6, tx + tw - 6, CY + ih - 6, 20);
-                if (cur_img && !VD_DIAG_LOAD_ONLY) {
+                if (cur_img) {
                     draw_rect(ix + 4, CY + 4, iw, ih, BLACK);   // 4px hard shadow
                     draw_rect(ix, CY, iw, ih, WHITE);           // region bg
                     draw_image_fit(cur_img, ix, CY, iw, ih);
                     draw_rect_outline(ix, CY, iw, ih, BLACK, BORDER);
-                } else {                                        // placeholder
+                } else {                                        // missing/failed load
                     draw_shadow_rect(ix, CY, iw, ih, WHITE, BLACK, 4);
                     draw_text_centered(bold, "[IMAGE]", ix + iw / 2,
                                        CY + ih / 2 - 12, 20, BLACK);

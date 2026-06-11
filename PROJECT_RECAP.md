@@ -312,11 +312,32 @@ faulting PC against the unstripped ELF):
 - **The hard wall — image draws GPU-fault under stress.** A clean isolation chain (no-images →
   stable; load-but-don't-draw → stable; load+draw → crash) proved the fault is specifically
   **`vita2d_draw_texture_scale` of decoded image textures under rapid flipping**. It survived
-  *every* mitigation — small/aligned textures, near-1:1 scale, GPU-idle `wait_rendering_done`,
-  and a never-free cache mirroring the stress-proof glyph path. Concluded: a vita2d/GXM limit,
-  not an app bug. **Image cards now render a clean `[IMAGE]` placeholder** (`VD_DIAG_NO_IMAGES`),
-  which is rock-stable; the loader/exporter groundwork stays in so real images can be revisited
-  later (offscreen render-target, or a glyph-style texture atlas).
+  *every* mitigation tried at the time — small/aligned textures, near-1:1 scale, GPU-idle
+  `wait_rendering_done`, and a never-free cache mirroring the stress-proof glyph path — so it was
+  provisionally concluded to be a vita2d/GXM limit and a `[IMAGE]` placeholder shipped.
+- **First hypothesis — texture *format* — TESTED ON HARDWARE AND DISPROVEN.** vita2d's JPEG
+  loader returns 24-bit textures (`SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR` color / `U8_R111` gray,
+  read from `xerpi/libvita2d` vs this SDK's `psp2/gxm.h`), so `img_to_rgba32` was added to
+  re-wrap every decode into 32-bit `A8B8G8R8` — byte-identical in kind to the stress-proof glyph
+  textures. It **still GPU-crashed** (fresh `GPUCRASH` coredump). This *eliminated* format (and,
+  with the earlier never-free result, free-timing and size-alone) as the cause. The 32-bit
+  conversion is kept anyway (cheap, correct hygiene, and gives us a texture we own to configure).
+- **Actual root cause — texture WRAP mode on a scaled NPOT draw.** The only remaining difference
+  between the stable glyph path and the crashing image path: glyphs draw **1:1**, images draw
+  **scaled**. `sceGxmTextureInitLinear` defaults the U/V address mode to **REPEAT** (`gxm.h:901`,
+  value 0) and vita2d **never** overrides it. A scaled, linear-filtered draw interpolates the
+  last row/column against the *wrapped opposite edge* — invalid for **non-power-of-two** linear
+  textures → GPU MMU fault. Glyphs are also NPOT but draw 1:1, so they never sample across the
+  edge and never fault. The exporter's ×16 alignment does **not** make dimensions power-of-two,
+  so it never helped, and "near-1:1 scale" still interpolates at the edge. **Wrap mode was never
+  on the prior mitigation list.**
+- **Fix — CONFIRMED WORKING on hardware.** `img_to_rgba32` sets `SCE_GXM_TEXTURE_ADDR_CLAMP`
+  on both U/V axes (valid for NPOT; `gxm.h:903`) plus explicit LINEAR min/mag filters, via
+  `sceGxmTextureSet*` on the public `tex->gxm_tex`. Images now render under the full 50-card
+  MCAT flip stress test with no GPU fault. The retained 32-bit conversion and 32-entry LRU
+  (evict-on-full while the GPU is idle) ride along. The `VD_DIAG_NO_IMAGES`/`VD_DIAG_LOAD_ONLY`
+  diagnostic flags have been removed now that the path is proven; a null decode (missing file /
+  unknown format) still falls back to the `[IMAGE]` placeholder.
 - **Stack-overflow fix.** Raising the image cache for the never-free experiment pushed
   `run_reviewer`'s big locals (a `Card` + two 8 KB text buffers + the cache) past the small
   main-thread stack, crashing inside freetype's rasterizer (`gray_convert_glyph`). Fixed by
@@ -331,9 +352,10 @@ faulting PC against the unstripped ELF):
 ---
 
 ## Known limitation
-- **Image cards render an `[IMAGE]` placeholder** instead of the decoded image — drawing image
-  textures GPU-faults under stress (see the saga above); a vita2d/GXM limit. Everything else
-  (text, cloze, gamification, stats, audio, resume) is fully functional.
+- **Image rendering now works** (see the saga above): the GPU fault was a texture WRAP-mode bug
+  on scaled NPOT draws, fixed by forcing `SCE_GXM_TEXTURE_ADDR_CLAMP`. Confirmed on hardware
+  under the 50-card MCAT stress test. Text, cloze, gamification, stats, audio, and resume are all
+  fully functional too.
 - **LiveArea splash background doesn't display** (accepted). The packaging is byte-correct
   against the working SDK sample (valid `a1` template, 8-bit palette PNGs, `content-rev`
   bumped) — the most likely cause is the Vita's LiveArea cache not refreshing on
@@ -353,9 +375,10 @@ faulting PC against the unstripped ELF):
 - Build: MSYS2 + vitasdk (`C:\msys64\usr\local\vitasdk`) → `vitadeck_p3.vpk`
   (title **VDCKREV01**), staged to the Vita each round.
 
-**Confirmed working on hardware**, with two accepted limitations: image cards show a
-placeholder (GPU draw limit) and the LiveArea splash doesn't display. The one open thread
-outside the Vita app is the optional live `importer.py` run into the real Anki collection.
+**Confirmed working on hardware**, including image cards (the GPU-draw fault is fixed — see the
+image-rendering saga). One cosmetic limitation remains: the LiveArea splash doesn't display. The
+one open thread outside the Vita app is the optional live `importer.py` run into the real Anki
+collection.
 
 ---
 
